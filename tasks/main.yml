@@ -1,0 +1,9 @@
+---
+- name: "Add repo"
+  include: "repo_add.yml"
+
+- name: "Install"
+  include: "install.yml"
+
+- name: "Configure"
+  include: "configure.yml"

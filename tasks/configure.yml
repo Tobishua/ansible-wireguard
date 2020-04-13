@@ -1,0 +1,150 @@
+---
+- name: Ensure group "wireguard" exists
+  group:
+    name: wireguard
+    state: present
+
+- name: Add the user "wireguard"
+  user:
+    name: wireguard
+    comment: Wireguard user
+    group: wireguard
+    create_home: false
+    shell: /usr/bin/false
+
+- name: Create a etc directory for Wireguard
+  file:
+    path: /etc/wireguard
+    state: directory
+    owner: wireguard
+    group: wireguard
+    mode: '0700'
+
+- name: Check that the privatekey exists
+  stat:
+    path: /etc/wireguard/privatekey
+  register: privatekey_file
+
+- name: Check that the publickey exists
+  stat:
+    path: /etc/wireguard/publickey
+  register: publickey_file
+
+- name: Get key
+  shell: "wg genkey | tee privatekey | wg pubkey > publickey"
+  args:
+    chdir: /etc/wireguard/
+  when: not privatekey_file.stat.exists or not publickey_file.stat.exists
+
+- name: Get server public key
+  slurp:
+    src: /etc/wireguard/publickey
+  register: server_publickey
+  delegate_to: "{{ wireguard_server }}"
+  delegate_facts: true
+  become: true
+
+- name: Get client public key
+  slurp:
+    src: /etc/wireguard/publickey
+  register: client_publickey
+  become: true
+
+- name: Get client private key
+  slurp:
+    src: /etc/wireguard/privatekey
+  register: client_privatekey
+  become: true
+  tags: config
+
+- name: Check that config exists
+  stat:
+    path: /etc/wireguard/wg0.conf
+  register: config_file
+
+- name: Set wg0 server config
+  template:
+    src: templates/wg0_server.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    owner: wireguard
+    group: wireguard
+    mode: '0644'
+  when: inventory_hostname in groups.wireguard_server and config_file.stat.exists == false
+  notify:
+    - "Restart Wireguard"
+
+- name: Set wg0 client config
+  template:
+    src: templates/wg0_client.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    owner: wireguard
+    group: wireguard
+    mode: '0644'
+  when: inventory_hostname not in groups.wireguard_server and config_file.stat.exists == false
+  notify:
+    - "Restart Wireguard"
+  tags: config
+
+- name: Restart Wireguard
+  systemd:
+    state: restarted
+    enabled: true
+    daemon_reload: true
+    name: wg-quick@wg0
+  when: config_file.stat.exists == false
+
+- name: Revoke old peers
+  shell: "wg set wg0 peer {{ item }} remove"
+  become: true
+  delegate_to: "{{ wireguard_server }}"
+  delegate_facts: true
+  ignore_errors: true
+  with_items: "{{ wireguard_revoked }}"
+
+- name: Check server publickey in client config
+  lineinfile:
+    path: /etc/wireguard/wg0.conf
+    regexp: "^PublicKey = {{ server_publickey['content'] | b64decode | replace('\n', '') }}*"
+    state: absent
+  check_mode: true
+  changed_when: false
+  become: true
+  register: client_configured
+  when: inventory_hostname not in groups.wireguard_server
+
+- name: Check client publickey in server config
+  lineinfile:
+    path: /etc/wireguard/wg0.conf
+    regexp: "^PublicKey = {{ client_publickey['content'] | b64decode | replace('\n', '') }}*"
+    state: absent
+  check_mode: true
+  changed_when: false
+  become: true
+  delegate_to: "{{ wireguard_server }}"
+  delegate_facts: true
+  register: server_configured
+
+- name: Connect client to the servers
+  shell: "wg set wg0 peer {{ server_publickey['content'] | b64decode | replace('\n', '') }} endpoint {{ hostvars[item].external_addr }}:{{ hostvars[item].wireguard.port }} allowed-ips {{ wireguard_nets }}"
+  become: true
+  when: inventory_hostname not in groups.wireguard_server and hostvars[item].external_addr is defined and hostvars[item].wireguard.port is defined
+  with_items: "{{ wireguard_server }}"
+
+- name: Connect server to the client
+  shell: "wg set wg0 peer {{ client_publickey['content'] | b64decode | replace('\n', '') }} allowed-ips {{ wireguard.ip }}/32"
+  become: true
+  delegate_to: "{{ wireguard_server }}"
+  delegate_facts: true
+  when: inventory_hostname not in groups.wireguard_server and not server_configured.found
+
+- name: Save server config
+  shell: "wg-quick save wg0"
+  become: true
+  delegate_to: "{{ wireguard_server }}"
+  delegate_facts: true
+  when: inventory_hostname not in groups.wireguard_server and not server_configured.found
+
+- name: Save client config
+  shell: "wg-quick save wg0"
+  become: true
+  when: inventory_hostname not in groups.wireguard_server and not client_configured.found

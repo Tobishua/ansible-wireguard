@@ -1,0 +1,5 @@
+[Interface]
+PrivateKey = {{ client_privatekey['content'] | b64decode | replace('\n', '') }}
+Address = {{ wireguard.ip }}/24
+ListenPort = {{ wireguard.port }}
+SaveConfig = true
